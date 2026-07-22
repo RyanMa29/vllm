@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import json
+import os
+import time
 from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -126,6 +129,88 @@ def _get_pooling_model_name(orig_model_name: str, pooling_suffix: str) -> str:
     return model_name + pooling_suffix
 
 
+def _maybe_enable_layer_hook_dump(model: nn.Module) -> None:
+    """Enable optional per-layer activation dump for pooling models.
+
+    Activated only when VLLM_LAYER_HOOK_DUMP_PATH is set.
+    """
+    dump_path = os.getenv("VLLM_LAYER_HOOK_DUMP_PATH")
+    if not dump_path:
+        return
+
+    layer_prefix = os.getenv("VLLM_LAYER_HOOK_LAYER_PREFIX", "language_model.model")
+    max_records = int(os.getenv("VLLM_LAYER_HOOK_MAX_RECORDS", "100000"))
+
+    dump_dir = os.path.dirname(dump_path)
+    if dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
+
+    meta_path = dump_path + ".meta.json"
+    state = {"count": 0}
+    handles = []
+    all_module_names = []
+
+    def _make_hook(layer_name: str):
+        def _hook(_module, _inp, out):
+            if state["count"] >= max_records:
+                return
+
+            tensor = out[0] if isinstance(out, tuple) else out
+            if not isinstance(tensor, torch.Tensor):
+                return
+
+            t = tensor.detach().float()
+            head = t.flatten()[:16].cpu().tolist()
+            rec = {
+                "ts": time.time(),
+                "pid": os.getpid(),
+                "layer": layer_name,
+                "call_idx": state["count"],
+                "shape": list(t.shape),
+                "mean": float(t.mean().item()),
+                "std": float(t.std().item()),
+                "amax": float(t.abs().max().item()),
+                "head": [float(x) for x in head],
+            }
+            with open(dump_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+            state["count"] += 1
+
+        return _hook
+
+    for name, module in model.named_modules():
+        all_module_names.append(name)
+        if not name.startswith(layer_prefix):
+            continue
+        if ".layers." not in name:
+            continue
+        handles.append(module.register_forward_hook(_make_hook(name)))
+
+    if not handles:
+        for name, module in model.named_modules():
+            if ".layers." not in name:
+                continue
+            if ".self_attn" in name or ".mlp" in name or name.endswith(".layers"):
+                handles.append(module.register_forward_hook(_make_hook(name)))
+
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pid": os.getpid(),
+                    "layer_prefix": layer_prefix,
+                    "registered_hook_count": len(handles),
+                    "sample_module_names": all_module_names[:120],
+                },
+                f,
+                indent=2,
+            )
+    except Exception:
+        logger.exception("Failed to write layer-hook meta file: %s", meta_path)
+
+    model._layer_hook_dump_handles = handles
+
+
 def _create_pooling_model_cls(orig_cls: _T) -> _T:
     # Lazy import
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -165,6 +250,7 @@ def _create_pooling_model_cls(orig_cls: _T) -> _T:
                 pooler = self._init_pooler(vllm_config, prefix=prefix)
 
             self.pooler = pooler
+            _maybe_enable_layer_hook_dump(self)
 
         def _init_pooler(
             self,

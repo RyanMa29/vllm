@@ -16,6 +16,9 @@
 # limitations under the License.
 """Transformers modeling backend mixins for pooling models."""
 
+import json
+import os
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -100,3 +103,86 @@ class SequenceClassificationMixin(SupportsCrossEncoding, VllmModelForPooling):
             pooler_config,
             classifier=self.classifier,
         )
+
+        self._maybe_enable_layer_hook_dump()
+
+    def _maybe_enable_layer_hook_dump(self) -> None:
+        """Optionally dump per-layer activations during inference.
+
+        Enabled only when `VLLM_LAYER_HOOK_DUMP_PATH` is set.
+        """
+        dump_path = os.getenv("VLLM_LAYER_HOOK_DUMP_PATH")
+        if not dump_path:
+            return
+
+        layer_prefix = os.getenv("VLLM_LAYER_HOOK_LAYER_PREFIX", "language_model.model")
+        max_records = int(os.getenv("VLLM_LAYER_HOOK_MAX_RECORDS", "100000"))
+
+        os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+
+        meta_path = dump_path + ".meta.json"
+        state = {"count": 0}
+        handles = []
+        all_module_names = []
+
+        def _make_hook(layer_name: str):
+            def _hook(_module, _inp, out):
+                if state["count"] >= max_records:
+                    return
+
+                tensor = out[0] if isinstance(out, tuple) else out
+                if not isinstance(tensor, torch.Tensor):
+                    return
+
+                t = tensor.detach().float()
+                head = t.flatten()[:16].cpu().tolist()
+                rec = {
+                    "ts": time.time(),
+                    "pid": os.getpid(),
+                    "layer": layer_name,
+                    "call_idx": state["count"],
+                    "shape": list(t.shape),
+                    "mean": float(t.mean().item()),
+                    "std": float(t.std().item()),
+                    "amax": float(t.abs().max().item()),
+                    "head": [float(x) for x in head],
+                }
+                with open(dump_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec) + "\n")
+                state["count"] += 1
+
+            return _hook
+
+        for name, module in self.named_modules():
+            all_module_names.append(name)
+            if not name.startswith(layer_prefix):
+                continue
+            if ".layers." not in name:
+                continue
+            handles.append(module.register_forward_hook(_make_hook(name)))
+
+        # Fallback for architecture naming differences when prefix match finds none.
+        if not handles:
+            for name, module in self.named_modules():
+                if ".layers." not in name:
+                    continue
+                if ".self_attn" in name or ".mlp" in name or name.endswith(".layers"):
+                    handles.append(module.register_forward_hook(_make_hook(name)))
+
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "layer_prefix": layer_prefix,
+                        "registered_hook_count": len(handles),
+                        "sample_module_names": all_module_names[:120],
+                    },
+                    f,
+                    indent=2,
+                )
+        except Exception:
+            pass
+
+        # Keep references so hooks stay active.
+        self._layer_hook_dump_handles = handles
