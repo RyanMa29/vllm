@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 import requests
@@ -12,6 +14,11 @@ from vllm.multimodal.utils import encode_image_url, fetch_image
 from vllm.platforms import current_platform
 
 MODEL_NAME = "Qwen/Qwen3-VL-Reranker-2B"
+THREE_HOURS_SECONDS = 3 * 60 * 60
+LAYER0_KERNEL_DUMP_DIR = Path(
+    "/mnt/disk2/ziyangma/.cache/ut_cross_encoder_online_vision_exp/"
+    "layer0_kernel_io_0729"
+)
 HF_OVERRIDES = {
     "architectures": ["Qwen3VLForSequenceClassification"],
     "classifier_from_token": ["no", "yes"],
@@ -25,7 +32,11 @@ ROCM_ATTN_BACKENDS = [
     "FLEX_ATTENTION",
 ]
 
-ATTN_BACKENDS = ROCM_ATTN_BACKENDS if current_platform.is_rocm() else ["auto"]
+ATTN_BACKENDS = (
+    ROCM_ATTN_BACKENDS
+    if current_platform.is_rocm()
+    else [os.getenv("VLLM_TEST_ATTN_BACKEND", "auto")]
+)
 
 # Per-backend tolerance with explicit entries; "default" is the fallback
 BACKEND_TOL: dict[str, float] = {
@@ -119,10 +130,16 @@ TEXT_VS_TEXT_PLUS_IMAGE = 0.5298863053321838
 def server(request):
     backend = request.param
     print(f"\n=== Starting server with attention backend: {backend} ===")
+    run_label = os.getenv("VLLM_LAYER0_KERNEL_RUN_LABEL", backend)
+    dump_path = LAYER0_KERNEL_DUMP_DIR / f"layer0_kernel_io_{run_label}.json"
+    dump_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_path.unlink(missing_ok=True)
     args = [
         "--enforce-eager",
         "--max-model-len",
         "8192",
+        "--limit-mm-per-prompt",
+        json.dumps({"image": 1, "video": 0}),
         "--chat-template",
         str(VLLM_PATH / "examples/pooling/score/template/qwen3_vl_reranker.jinja"),
     ]
@@ -136,8 +153,19 @@ def server(request):
         if backend != "ROCM_AITER_FA":
             env["VLLM_ROCM_USE_AITER"] = "0"
 
+    env["VLLM_LAYER0_KERNEL_DUMP_PATH"] = str(dump_path)
+    env["VLLM_LAYER0_ATTN_TARGET_TOKENS"] = "81"
+    if force_cpu_ref := os.getenv("VLLM_XPU_FORCE_REF_ATTN_CPU"):
+        env["VLLM_XPU_FORCE_REF_ATTN_CPU"] = force_cpu_ref
+    if force_ref_device := os.getenv("VLLM_XPU_FORCE_REF_ATTN_DEVICE"):
+        env["VLLM_XPU_FORCE_REF_ATTN_DEVICE"] = force_ref_device
+
     with RemoteOpenAIServer(
-        MODEL_NAME, args, override_hf_configs=HF_OVERRIDES, env_dict=env
+        MODEL_NAME,
+        args,
+        override_hf_configs=HF_OVERRIDES,
+        env_dict=env,
+        max_wait_seconds=THREE_HOURS_SECONDS,
     ) as remote_server:
         print(f"=== Server ready with backend: {backend} ===")
         yield remote_server, backend
@@ -155,6 +183,7 @@ async def test_score_api_queries_str_documents_str(
             "queries": query,
             "documents": document,
         },
+        timeout=THREE_HOURS_SECONDS,
     )
     score_response.raise_for_status()
     score = ScoreResponse.model_validate(score_response.json())

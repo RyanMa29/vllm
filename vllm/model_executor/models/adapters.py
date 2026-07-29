@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import json
+import os
 from collections.abc import Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -35,6 +37,99 @@ _GENERATE_SUFFIXES = [
     "ChatModel",
     "LMHeadModel",
 ]
+
+
+def _maybe_register_layer0_attention_dump(model: nn.Module) -> None:
+    dump_path = os.getenv("VLLM_LAYER0_KERNEL_DUMP_PATH")
+    if not dump_path:
+        return
+
+    matches = [
+        (name, module)
+        for name, module in model.named_modules()
+        if name.endswith("language_model.model.layers.0.self_attn")
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Expected exactly one layer0 self_attn module, "
+            f"found {[name for name, _ in matches]}"
+        )
+
+    layer_name, layer = matches[0]
+    target_tokens = int(os.getenv("VLLM_LAYER0_ATTN_TARGET_TOKENS", "81"))
+    kernel_names = ("qkv_proj", "q_norm", "k_norm", "rotary_emb", "attn", "o_proj")
+    kernels = {name: layer.get_submodule(name) for name in kernel_names}
+    state: dict[str, Any] = {"handles": [], "records": {}}
+
+    def _serialize_tensors(value: Any, path: str) -> list[dict[str, Any]]:
+        if isinstance(value, torch.Tensor):
+            detached = value.detach().cpu()
+            return [
+                {
+                    "path": path,
+                    "shape": list(detached.shape),
+                    "dtype": str(detached.dtype),
+                    "tensor_numel": int(detached.numel()),
+                    "tensor_flat": detached.float().reshape(-1).tolist(),
+                }
+            ]
+        if isinstance(value, (tuple, list)):
+            return list(
+                itertools.chain.from_iterable(
+                    _serialize_tensors(item, f"{path}.{index}")
+                    for index, item in enumerate(value)
+                )
+            )
+        if isinstance(value, dict):
+            return list(
+                itertools.chain.from_iterable(
+                    _serialize_tensors(item, f"{path}.{key}")
+                    for key, item in value.items()
+                )
+            )
+        return []
+
+    def _make_hook(kernel_name: str):
+        def _hook(_module, args, kwargs, output):
+            if kernel_name in state["records"]:
+                return
+            inputs = _serialize_tensors(args, "args") + _serialize_tensors(
+                kwargs, "kwargs"
+            )
+            outputs = _serialize_tensors(output, "output")
+            tensors = inputs + outputs
+            if not any(
+                tensor["shape"] and tensor["shape"][0] == target_tokens
+                for tensor in tensors
+            ):
+                return
+
+            state["records"][kernel_name] = {
+                "kernel": f"{layer_name}.{kernel_name}",
+                "input": inputs,
+                "output": outputs,
+            }
+            if len(state["records"]) != len(kernels):
+                return
+
+            record = {
+                "layer": layer_name,
+                "target_tokens": target_tokens,
+                "kernels": [state["records"][name] for name in kernel_names],
+            }
+            os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+            temporary_path = f"{dump_path}.tmp.{os.getpid()}"
+            with open(temporary_path, "w", encoding="utf-8") as f:
+                json.dump(record, f)
+            os.replace(temporary_path, dump_path)
+            for handle in state["handles"]:
+                handle.remove()
+
+        return _hook
+
+    for kernel_name, kernel in kernels.items():
+        handle = kernel.register_forward_hook(_make_hook(kernel_name), with_kwargs=True)
+        state["handles"].append(handle)
 
 
 def _load_st_projector(model_config: "ModelConfig") -> nn.Module | None:
@@ -165,6 +260,7 @@ def _create_pooling_model_cls(orig_cls: _T) -> _T:
                 pooler = self._init_pooler(vllm_config, prefix=prefix)
 
             self.pooler = pooler
+            _maybe_register_layer0_attention_dump(self)
 
         def _init_pooler(
             self,
