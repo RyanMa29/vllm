@@ -1005,6 +1005,25 @@ class TestDeviceIds:
 
 
 class TestDpDeviceIdSharding:
+    def test_xpu_ray_actor_keeps_preassigned_device(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from vllm.platforms import current_platform
+        from vllm.v1.engine.core import EngineCoreActorMixin
+
+        if not current_platform.is_xpu():
+            pytest.skip("XPU device visibility is required")
+
+        monkeypatch.setenv(current_platform.device_control_env_var, "1")
+        config = SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=1, assigned_physical_gpu_ids=[1])
+        )
+
+        actor = object.__new__(EngineCoreActorMixin)
+        actor._set_visible_devices(config, local_dp_rank=1)
+
+        assert config.parallel_config.assigned_physical_gpu_ids == [1]
+
     def test_dp_supervisor_device_ids_stay_env_relative(self):
         """Regression test: the DP supervisor must pass env-relative indices,
         not physical IDs, because each child re-resolves --device-ids

@@ -23,6 +23,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.device_communicators import flashinfer_all_reduce
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+from vllm.distributed.device_communicators.xpu_communicator import XpuCommunicator
 from vllm.distributed.parallel_state import GroupCoordinator, TensorMetadata
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
@@ -453,6 +454,74 @@ def test_aiter_all_gather_precedes_pynccl(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(communicator, "_can_use_aiter_ag_rs", Mock(return_value=True))
 
     assert communicator.all_gatherv(torch.empty(1)) is output
+
+
+def test_xpu_equal_size_all_gatherv_uses_contiguous_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator = XpuCommunicator.__new__(XpuCommunicator)
+    communicator.world_size = 4
+    communicator.rank_in_group = 0
+    communicator.device_group = Mock()
+    communicator.cpu_group = Mock()
+    communicator.use_all2all = False
+    input_tensor = torch.arange(2)
+
+    def gather(output: torch.Tensor, source: torch.Tensor, *, group: Any) -> None:
+        assert output.shape == (8,)
+        assert source is input_tensor
+        assert group is communicator.cpu_group
+        output.copy_(source.repeat(4))
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
+    assert torch.equal(
+        communicator.all_gatherv(input_tensor, sizes=[2] * 4),
+        input_tensor.repeat(4),
+    )
+
+
+@pytest.mark.parametrize("sizes", [[2, 1, 3, 1], [2, 1]])
+def test_xpu_uneven_all_gatherv_uses_cpu_group(
+    monkeypatch: pytest.MonkeyPatch,
+    sizes: list[int],
+) -> None:
+    communicator = XpuCommunicator.__new__(XpuCommunicator)
+    communicator.world_size = len(sizes)
+    communicator.rank_in_group = 0
+    communicator.cpu_group = object()
+    communicator.device_group = object()
+    input_tensor = torch.ones(2)
+
+    def gather(output, source, *, group):
+        assert group is communicator.cpu_group
+        assert source.device.type == "cpu"
+        assert source.tolist() == [1, 1] + [0] * (max(sizes) - 2)
+        assert output.shape == (len(sizes) * max(sizes),)
+        for rank in range(len(sizes)):
+            output[rank * max(sizes) : (rank + 1) * max(sizes)].fill_(rank)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", gather)
+    assert torch.equal(
+        communicator.all_gatherv(input_tensor, sizes=sizes),
+        torch.tensor([rank for rank, size in enumerate(sizes) for _ in range(size)]),
+    )
+
+
+def test_xpu_four_rank_reduce_scatterv_uses_cpu_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    communicator = XpuCommunicator.__new__(XpuCommunicator)
+    communicator.world_size = 4
+    communicator.rank_in_group = 2
+    communicator.cpu_group = Mock()
+
+    def reduce(tensor: torch.Tensor, *, group: Any) -> None:
+        assert tensor.device.type == "cpu"
+        assert group is communicator.cpu_group
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    output = communicator.reduce_scatterv(torch.arange(8), dim=0, sizes=[1, 2, 3, 2])
+    assert torch.equal(output, torch.tensor([3, 4, 5]))
 
 
 def test_isend_object_posts_size_then_object_and_releases_on_wait(

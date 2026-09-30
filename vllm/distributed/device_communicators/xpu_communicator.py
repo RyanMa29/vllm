@@ -7,6 +7,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
+from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 
 from .base_device_communicator import DeviceCommunicatorBase
@@ -21,17 +22,28 @@ class XpuCommunicator(DeviceCommunicatorBase):
         device: torch.device | None = None,
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
+        global_ranks: list[int] | None = None,
+        global_world_size: int | None = None,
+        tcp_store_group: StatelessProcessGroup | None = None,
         use_all2all: bool = False,
     ):
         super().__init__(
-            cpu_group, device, device_group, unique_name, use_all2all=use_all2all
+            cpu_group,
+            device,
+            device_group,
+            unique_name,
+            global_ranks=global_ranks,
+            global_world_size=global_world_size,
+            use_all2all=use_all2all,
         )
         self.ca_comm: None = None
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
 
-                self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+                self.all2all_manager = AgRsAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
                 logger.info("Using AgRs manager on XPU device.")
 
             else:  # type: ignore[has-type]
@@ -43,8 +55,21 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 )
                 from .all2all import AgRsAll2AllManager
 
-                self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
+                self.all2all_manager = AgRsAll2AllManager(
+                    self.cpu_group, tcp_store_group
+                )
                 logger.info("Using AgRs manager on XPU device.")
+
+    def batch_isend_irecv(self, p2p_ops: list[dist.P2POp]):
+        for op in p2p_ops:
+            peer = (
+                {"group_dst": op.group_peer}
+                if op.op is dist.isend
+                else {"group_src": op.group_peer}
+            )
+            request = op.op(op.tensor, group=self.device_group, **peer)
+            assert request is not None
+            request.wait()
 
     def _fixed_rank_sum(self, input_: torch.Tensor) -> torch.Tensor:
         flat_input = input_.reshape(-1)
@@ -131,6 +156,15 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 else sum(sizes[: self.rank_in_group])
             )
             output.copy_(reduced.narrow(0, start, chunk_size))
+        elif world_size > 2:
+            reduced = input_tensor.cpu()
+            dist.all_reduce(reduced, group=self.cpu_group)
+            start = (
+                self.rank_in_group * chunk_size
+                if sizes is None
+                else sum(sizes[: self.rank_in_group])
+            )
+            output.copy_(reduced.narrow(0, start, chunk_size))
         elif sizes is None or sizes.count(sizes[0]) == len(sizes):
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
         elif torch.xpu.device_count() < self.world_size:
@@ -183,19 +217,34 @@ class XpuCommunicator(DeviceCommunicatorBase):
             )
 
             if sizes is not None:
-                all_gather_list = []
-                for size in sizes:
-                    all_gather_list.append(
-                        torch.empty(
-                            (size,) + input_.shape[1:],
-                            dtype=input_.dtype,
-                            device=input_.device,
-                        )
+                padded_size = max(sizes)
+                padded = torch.zeros(
+                    (padded_size,) + input_.shape[1:], dtype=input_.dtype
+                )
+                padded[: input_.shape[0]].copy_(input_.cpu())
+                gathered = torch.empty(
+                    (world_size * padded_size,) + input_.shape[1:],
+                    dtype=input_.dtype,
+                )
+                dist.all_gather_into_tensor(gathered, padded, group=self.cpu_group)
+                gathered = gathered.view((world_size, padded_size) + input_.shape[1:])
+                output_tensor.copy_(
+                    torch.cat(
+                        [gathered[rank, :size] for rank, size in enumerate(sizes)],
+                        dim=0,
                     )
-                dist.all_gather(all_gather_list, input_, group=self.device_group)
-                output_tensor = torch.cat(all_gather_list, dim=0)
+                )
             else:
-                dist.all_gather([output_tensor], input_, group=self.device_group)
+                if world_size > 2:
+                    gathered = torch.empty(output_size, dtype=input_.dtype)
+                    dist.all_gather_into_tensor(
+                        gathered, input_.cpu(), group=self.cpu_group
+                    )
+                    output_tensor.copy_(gathered)
+                else:
+                    dist.all_gather_into_tensor(
+                        output_tensor, input_, group=self.device_group
+                    )
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
@@ -236,8 +285,9 @@ class XpuCommunicator(DeviceCommunicatorBase):
             output_tensor = None
         return output_tensor
 
-    def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
-        dist.broadcast(input_, src=src, group=self.device_group)
+    def broadcast(self, input_: torch.Tensor, src: int = 0) -> torch.Tensor:
+        dist.broadcast(input_, group_src=src, group=self.device_group)
+        return input_
 
     def dispatch_router_logits(
         self,

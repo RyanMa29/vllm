@@ -2521,6 +2521,11 @@ class EngineCoreActorMixin:
     def _set_visible_devices(self, vllm_config: VllmConfig, local_dp_rank: int):
         from vllm.platforms import current_platform
 
+        if (
+            current_platform.is_xpu()
+            and vllm_config.parallel_config.assigned_physical_gpu_ids is not None
+        ):
+            return
         device_control_env_var = current_platform.device_control_env_var
         self._set_assigned_physical_gpu_ids(
             vllm_config, local_dp_rank, device_control_env_var

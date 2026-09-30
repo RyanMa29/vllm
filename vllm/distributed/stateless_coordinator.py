@@ -190,17 +190,32 @@ class StatelessGroupCoordinator(GroupCoordinator):
             device_comm_cls = resolve_obj_by_qualname(
                 current_platform.get_device_communicator_cls()
             )
-            assert device_comm_cls == CudaCommunicator
-            self.device_communicator = CudaCommunicator(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                device_group=self.device_group,
-                unique_name=self.unique_name,
-                global_ranks=self.ranks,
-                global_world_size=global_world_size,
-                tcp_store_group=self.tcp_store_group,
-                use_all2all=use_all2all,
-            )
+            if device_comm_cls == CudaCommunicator:
+                self.device_communicator = CudaCommunicator(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                    global_ranks=self.ranks,
+                    global_world_size=global_world_size,
+                    tcp_store_group=self.tcp_store_group,
+                    use_all2all=use_all2all,
+                )
+            elif current_platform.is_xpu():
+                self.device_communicator = device_comm_cls(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                    global_ranks=self.ranks,
+                    global_world_size=global_world_size,
+                    tcp_store_group=self.tcp_store_group,
+                    use_all2all=use_all2all,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Stateless communicator unsupported: {device_comm_cls}"
+                )
 
         self.mq_broadcaster = None
 
@@ -225,8 +240,9 @@ class StatelessGroupCoordinator(GroupCoordinator):
         if self.world_size == 1:
             return input_
 
-        if self.device_communicator and input_.is_cuda:
-            return self.device_communicator.broadcast(input_, src)
+        if self.device_communicator and input_.device.type in ("cuda", "xpu"):
+            self.device_communicator.broadcast(input_, src)
+            return input_
         else:
             return self.tcp_store_group.broadcast(input_, src)
 
@@ -290,7 +306,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
-            if self.device_communicator and tensor.is_cuda:
+            if self.device_communicator and tensor.device.type in ("cuda", "xpu"):
                 tensor.copy_(self.device_communicator.broadcast(tensor, src))
             else:
                 tensor.copy_(self.tcp_store_group.broadcast(tensor, src))
@@ -327,7 +343,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
-            if self.device_communicator and tensor.is_cuda:
+            if self.device_communicator and tensor.device.type in ("cuda", "xpu"):
                 self.device_communicator.send(tensor, dst)
             else:
                 self.tcp_store_group.send(tensor, dst)
@@ -353,7 +369,10 @@ class StatelessGroupCoordinator(GroupCoordinator):
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                 if tensor.numel() > 0:
-                    if self.device_communicator and tensor.is_cuda:
+                    if self.device_communicator and tensor.device.type in (
+                        "cuda",
+                        "xpu",
+                    ):
                         tensor = self.device_communicator.recv(
                             tensor.size(), tensor.dtype, src
                         )

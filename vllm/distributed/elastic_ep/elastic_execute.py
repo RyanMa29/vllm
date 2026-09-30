@@ -142,10 +142,15 @@ def broadcast_expert_mapping(
         physical_to_logical = torch.empty(
             tuple(shape_tensor.tolist()),
             dtype=torch.int64,
-            device=device,
+            device="cpu" if current_platform.is_xpu() else device,
         )
 
     assert physical_to_logical is not None
+    if current_platform.is_xpu():
+        mapping = dp_group.tcp_store_group.broadcast(
+            physical_to_logical.cpu(), src_rank
+        )
+        return mapping.to(device)
     return dp_group.broadcast(physical_to_logical, src_rank)
 
 
@@ -295,10 +300,14 @@ class ElasticEPScalingExecutor:
         if not self._can_reuse_fused_moe_kernel():
             self.stage_standby_moe_quant_methods(all2all_manager)
         self._prepare_eplb_communicator(get_standby_eplb_group())
+        if new_dp_size > old_dp_size and current_platform.is_xpu():
+            self._warm_target_groups(get_standby_dp_group(), standby_ep_group)
         if new_dp_size > old_dp_size:
             self.transfer_weights(old_dp_size, new_dp_size)
         # On ROCm this deadlocks while serving; warm_and_capture warms these at commit.
-        if not current_platform.is_rocm():
+        if not current_platform.is_rocm() and not (
+            new_dp_size > old_dp_size and current_platform.is_xpu()
+        ):
             self._warm_target_groups(get_standby_dp_group(), standby_ep_group)
         if new_dp_size > old_dp_size and self._can_reuse_fused_moe_kernel():
             target_world_group = get_standby_world_group()
@@ -641,6 +650,8 @@ class ElasticEPScalingExecutor:
     def prepare_new_worker(self) -> None:
         dp_group = get_dp_group()
         assert isinstance(dp_group, StatelessGroupCoordinator)
+        if current_platform.is_xpu():
+            self._warm_target_groups(dp_group, get_ep_group())
         new_dp_size = dp_group.world_size
         dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
 
@@ -678,7 +689,7 @@ class ElasticEPScalingExecutor:
             expert_weights=expert_weights,
         )
         torch.accelerator.synchronize()
-        if not current_platform.is_rocm():
+        if not current_platform.is_rocm() and not current_platform.is_xpu():
             self._warm_target_groups(get_dp_group(), get_ep_group())
         if self._can_reuse_fused_moe_kernel():
             sync_flashinfer_autotune_cache(self.worker.model_runner, get_world_group())

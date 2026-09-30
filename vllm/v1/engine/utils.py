@@ -503,7 +503,13 @@ class CoreEngineActorManager:
             if current_platform.is_xpu():
                 device_evar = current_platform.device_control_env_var
                 physical_gpu_ids = get_physical_gpu_ids_for_local_dp_rank(
-                    device_evar, local_index, world_size
+                    device_evar,
+                    local_index,
+                    world_size,
+                    user_assigned_gpu_ids=parallel_config.assigned_physical_gpu_ids,
+                )
+                dp_vllm_config.parallel_config.assigned_physical_gpu_ids = (
+                    physical_gpu_ids
                 )
                 actor_env_vars = self.env_vars_dict.copy()
                 actor_env_vars[device_evar] = ",".join(str(d) for d in physical_gpu_ids)

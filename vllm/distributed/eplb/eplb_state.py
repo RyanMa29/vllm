@@ -1044,9 +1044,20 @@ class EplbState:
 
     def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """All-reduce a list of tensors."""
-        ep_group = get_ep_group().device_group
+        ep_coordinator = get_ep_group()
+        use_cpu_group = (
+            current_platform.is_xpu()
+            and isinstance(ep_coordinator, StatelessGroupCoordinator)
+            and ep_coordinator.world_size > 2
+        )
+        ep_group = (
+            ep_coordinator.cpu_group if use_cpu_group else ep_coordinator.device_group
+        )
         if len(tensor_list) == 1:
-            all_reduce(tensor_list[0], group=ep_group)
+            tensor = tensor_list[0].cpu() if use_cpu_group else tensor_list[0]
+            all_reduce(tensor, group=ep_group)
+            if use_cpu_group:
+                tensor_list[0].copy_(tensor)
             return tensor_list
         assert all(t.dim() == 2 for t in tensor_list), "All tensors must be 2D."
         assert all(t.shape[1] == tensor_list[0].shape[1] for t in tensor_list), (
@@ -1058,7 +1069,11 @@ class EplbState:
         shapes = [t.shape for t in tensor_list]
         concat_tensor = torch.cat(tensor_list, dim=0)
 
+        if use_cpu_group:
+            concat_tensor = concat_tensor.cpu()
         all_reduce(concat_tensor, group=ep_group)
+        if use_cpu_group:
+            concat_tensor = concat_tensor.to(tensor_list[0].device)
 
         all_reduce_list = []
         offset = 0
